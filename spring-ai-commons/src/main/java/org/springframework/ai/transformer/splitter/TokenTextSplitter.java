@@ -36,6 +36,8 @@ import org.springframework.util.Assert;
  */
 public class TokenTextSplitter extends TextSplitter {
 
+	private static final int DEFAULT_CHUNK_OVERLAP = 20;
+
 	private static final int DEFAULT_CHUNK_SIZE = 800;
 
 	private static final int MIN_CHUNK_SIZE_CHARS = 350;
@@ -49,6 +51,8 @@ public class TokenTextSplitter extends TextSplitter {
 	private final EncodingRegistry registry = Encodings.newLazyEncodingRegistry();
 
 	private final Encoding encoding = this.registry.getEncoding(EncodingType.CL100K_BASE);
+
+	private final int chunkOverlap;
 
 	// The target size of each text chunk in tokens
 	private final int chunkSize;
@@ -65,15 +69,16 @@ public class TokenTextSplitter extends TextSplitter {
 	private final boolean keepSeparator;
 
 	public TokenTextSplitter() {
-		this(DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE_CHARS, MIN_CHUNK_LENGTH_TO_EMBED, MAX_NUM_CHUNKS, KEEP_SEPARATOR);
+		this(DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE_CHARS, MIN_CHUNK_LENGTH_TO_EMBED, MAX_NUM_CHUNKS, KEEP_SEPARATOR);
 	}
 
 	public TokenTextSplitter(boolean keepSeparator) {
-		this(DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE_CHARS, MIN_CHUNK_LENGTH_TO_EMBED, MAX_NUM_CHUNKS, keepSeparator);
+		this(DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE_CHARS, MIN_CHUNK_LENGTH_TO_EMBED, MAX_NUM_CHUNKS, keepSeparator);
 	}
 
-	public TokenTextSplitter(int chunkSize, int minChunkSizeChars, int minChunkLengthToEmbed, int maxNumChunks,
+	public TokenTextSplitter(int chunkOverlap, int chunkSize, int minChunkSizeChars, int minChunkLengthToEmbed, int maxNumChunks,
 			boolean keepSeparator) {
+		this.chunkOverlap = chunkOverlap;
 		this.chunkSize = chunkSize;
 		this.minChunkSizeChars = minChunkSizeChars;
 		this.minChunkLengthToEmbed = minChunkLengthToEmbed;
@@ -95,45 +100,54 @@ public class TokenTextSplitter extends TextSplitter {
 			return new ArrayList<>();
 		}
 
-		List<Integer> tokens = getEncodedTokens(text);
+		List<Integer> allTokens = getEncodedTokens(text);
 		List<String> chunks = new ArrayList<>();
-		int num_chunks = 0;
-		while (!tokens.isEmpty() && num_chunks < this.maxNumChunks) {
-			List<Integer> chunk = tokens.subList(0, Math.min(chunkSize, tokens.size()));
-			String chunkText = decodeTokens(chunk);
+		int position = 0;
+		int chunkCount = 0;
 
-			// Skip the chunk if it is empty or whitespace
-			if (chunkText.trim().isEmpty()) {
-				tokens = tokens.subList(chunk.size(), tokens.size());
-				continue;
-			}
+		// First pass: determine chunk boundaries without overlap
+		List<Integer> chunkStartPositions = new ArrayList<>();
+		List<Integer> chunkEndPositions = new ArrayList<>();
 
-			// Find the last period or punctuation mark in the chunk
+		while (position < allTokens.size() && chunkCount < this.maxNumChunks) {
+			int endPosition = Math.min(position + chunkSize, allTokens.size());
+
+			// Get text for this range to find natural breakpoints
+			List<Integer> chunkTokens = allTokens.subList(position, endPosition);
+			String chunkText = decodeTokens(chunkTokens);
+
+			// Find natural breakpoint
 			int lastPunctuation = Math.max(chunkText.lastIndexOf('.'), Math.max(chunkText.lastIndexOf('?'),
 					Math.max(chunkText.lastIndexOf('!'), chunkText.lastIndexOf('\n'))));
 
 			if (lastPunctuation != -1 && lastPunctuation > this.minChunkSizeChars) {
-				// Truncate the chunk text at the punctuation mark
-				chunkText = chunkText.substring(0, lastPunctuation + 1);
+				// Adjust the chunk to end at this punctuation
+				String adjustedText = chunkText.substring(0, lastPunctuation + 1);
+				int adjustedTokenCount = getEncodedTokens(adjustedText).size();
+				endPosition = position + adjustedTokenCount;
 			}
 
-			String chunkTextToAppend = (this.keepSeparator) ? chunkText.trim()
-					: chunkText.replace(System.lineSeparator(), " ").trim();
-			if (chunkTextToAppend.length() > this.minChunkLengthToEmbed) {
-				chunks.add(chunkTextToAppend);
-			}
+			chunkStartPositions.add(position);
+			chunkEndPositions.add(endPosition);
 
-			// Remove the tokens corresponding to the chunk text from the remaining tokens
-			tokens = tokens.subList(getEncodedTokens(chunkText).size(), tokens.size());
-
-			num_chunks++;
+			// Move to the next position
+			position = endPosition;
+			chunkCount++;
 		}
 
-		// Handle the remaining tokens
-		if (!tokens.isEmpty()) {
-			String remaining_text = decodeTokens(tokens).replace(System.lineSeparator(), " ").trim();
-			if (remaining_text.length() > this.minChunkLengthToEmbed) {
-				chunks.add(remaining_text);
+		// Second pass: create chunks with overlap
+		for (int i = 0; i < chunkStartPositions.size(); i++) {
+			// Calculate overlapping range
+			int startWithOverlap = Math.max(0, chunkStartPositions.get(i) - (i > 0 ? this.chunkOverlap : 0));
+			int endWithOverlap = Math.min(allTokens.size(), chunkEndPositions.get(i) + (i < chunkStartPositions.size() - 1 ? this.chunkOverlap : 0));
+
+			List<Integer> chunkWithOverlap = allTokens.subList(startWithOverlap, endWithOverlap);
+			String chunkText = decodeTokens(chunkWithOverlap);
+
+			String finalChunkText = this.keepSeparator ? chunkText.trim() : chunkText.replace(System.lineSeparator(), " ").trim();
+
+			if (finalChunkText.length() > this.minChunkLengthToEmbed) {
+				chunks.add(finalChunkText);
 			}
 		}
 
@@ -154,6 +168,8 @@ public class TokenTextSplitter extends TextSplitter {
 
 	public static final class Builder {
 
+		private int chunkOverlap;
+
 		private int chunkSize;
 
 		private int minChunkSizeChars;
@@ -165,6 +181,11 @@ public class TokenTextSplitter extends TextSplitter {
 		private boolean keepSeparator;
 
 		private Builder() {
+		}
+
+		public Builder withChunkOverlap(int chunkOverlap) {
+			this.chunkOverlap = chunkOverlap;
+			return this;
 		}
 
 		public Builder withChunkSize(int chunkSize) {
@@ -193,7 +214,7 @@ public class TokenTextSplitter extends TextSplitter {
 		}
 
 		public TokenTextSplitter build() {
-			return new TokenTextSplitter(this.chunkSize, this.minChunkSizeChars, this.minChunkLengthToEmbed,
+			return new TokenTextSplitter(this.chunkOverlap, this.chunkSize, this.minChunkSizeChars, this.minChunkLengthToEmbed,
 					this.maxNumChunks, this.keepSeparator);
 		}
 
